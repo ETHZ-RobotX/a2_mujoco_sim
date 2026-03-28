@@ -9,6 +9,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 list(APPEND CMAKE_PREFIX_PATH "/opt/unitree_robotics/lib/cmake")
 find_package(unitree_sdk2 REQUIRED)
+find_package(ament_index_cpp REQUIRED)
 find_package(Boost REQUIRED COMPONENTS program_options)
 
 file(GLOB SIM_SRC
@@ -42,6 +43,10 @@ target_include_directories(unitree_mujoco PRIVATE
 
 
 target_link_directories(unitree_mujoco PRIVATE mujoco/lib)
+
+ament_target_dependencies(unitree_mujoco
+  ament_index_cpp
+)
 
 target_link_libraries(unitree_mujoco
   pthread # Note: Using target_link_libraries is preferred over link_libraries in ROS 2
