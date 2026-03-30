@@ -35,6 +35,7 @@
 #include "array_safety.h"
 #include "unitree_sdk2_bridge.h"
 #include "param.h"
+#include <ament_index_cpp/get_package_share_directory.hpp>
 
 #define MUJOCO_PLUGIN_DIR "mujoco_plugin"
 #define NUM_MOTOR_IDL_GO 20
@@ -673,30 +674,26 @@ int main(int argc, char **argv)
   mjvPerturb pert;
   mjv_defaultPerturb(&pert);
 
-  // Load simulation configuration
-  std::filesystem::path exec_dir(getExecutableDir());
-  std::filesystem::path install_prefix = exec_dir.empty() ? "." : exec_dir.parent_path().parent_path();
-  std::filesystem::path a2_mujoco_share = install_prefix / "share" / "a2_mujoco";
-  param::config.load_from_yaml(a2_mujoco_share / "config.yaml");
+  // Load simulation configuration using ROS2 package finder
+  std::string unitree_mujoco_share = ament_index_cpp::get_package_share_directory("unitree_mujoco");
+  std::filesystem::path config_path = std::filesystem::path(unitree_mujoco_share) / "config.yaml";
+  param::config.load_from_yaml(config_path.c_str());
 
-  // ROS 2 launch appends '--ros-args' and ROS-specific arguments to the command line.
-  // We truncate the argc passed to boost::program_options to hide them.
-  int app_argc = argc;
+  // Filter out ROS args (--ros-args and everything after) before passing to param::helper
+  // The Unitree SDK uses boost::program_options which doesn't understand ROS2 arguments
+  int filtered_argc = argc;
   for (int i = 0; i < argc; ++i) {
     if (std::string(argv[i]) == "--ros-args") {
-      app_argc = i;
+      filtered_argc = i;
       break;
     }
   }
-  param::helper(app_argc, argv);
+  param::helper(filtered_argc, argv);
 
   if(param::config.robot_scene.is_relative()) {
-    std::filesystem::path a2_description_share = install_prefix / "share" / "a2_description";
-    if (!std::filesystem::exists(a2_description_share)) {
-      // Fallback for isolated colcon builds
-      a2_description_share = install_prefix.parent_path() / "a2_description" / "share" / "a2_description";
-    }
-    param::config.robot_scene = a2_description_share / "mjcf" / param::config.robot_scene;
+    std::string a2_description_share = ament_index_cpp::get_package_share_directory("a2_description");
+    std::filesystem::path scene_path = std::filesystem::path(a2_description_share) / "mjcf" / param::config.robot_scene;
+    param::config.robot_scene = scene_path;
   }
 
   // --- Prevent Unitree DDS vs ROS 2 DDS Conflicts ---

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(a2_mujoco)
+project(unitree_mujoco)
 
 find_package(ament_cmake REQUIRED)
 
@@ -9,6 +9,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 list(APPEND CMAKE_PREFIX_PATH "/opt/unitree_robotics/lib/cmake")
 find_package(unitree_sdk2 REQUIRED)
+find_package(ament_index_cpp REQUIRED)
 find_package(Boost REQUIRED COMPONENTS program_options)
 
 file(GLOB SIM_SRC
@@ -19,9 +20,9 @@ file(GLOB SIM_SRC
   src/lodepng/lodepng.cpp
 )
 
-add_executable(a2_mujoco ${SIM_SRC} src/main.cc)
+add_executable(unitree_mujoco ${SIM_SRC} src/main.cc)
 
-set_target_properties(a2_mujoco PROPERTIES
+set_target_properties(unitree_mujoco PROPERTIES
   # This ensures the installed executable can find its shared library dependencies.
   # $ORIGIN refers to the executable's own directory.
   BUILD_WITH_INSTALL_RPATH TRUE
@@ -30,10 +31,10 @@ set_target_properties(a2_mujoco PROPERTIES
 
 # Force the linker to use RPATH instead of RUNPATH. This ensures the Unitree 
 # libraries are always loaded *before* the ROS 2 libraries in LD_LIBRARY_PATH.
-target_link_options(a2_mujoco PRIVATE "-Wl,--disable-new-dtags")
+target_link_options(unitree_mujoco PRIVATE "-Wl,--disable-new-dtags")
 
 # Use target_* commands to scope includes and links to specific targets.
-target_include_directories(a2_mujoco PRIVATE
+target_include_directories(unitree_mujoco PRIVATE
   mujoco/include
   mujoco/simulate
   src/lodepng
@@ -41,9 +42,13 @@ target_include_directories(a2_mujoco PRIVATE
 )
 
 
-target_link_directories(a2_mujoco PRIVATE mujoco/lib)
+target_link_directories(unitree_mujoco PRIVATE mujoco/lib)
 
-target_link_libraries(a2_mujoco
+ament_target_dependencies(unitree_mujoco
+  ament_index_cpp
+)
+
+target_link_libraries(unitree_mujoco
   pthread # Note: Using target_link_libraries is preferred over link_libraries in ROS 2
   mujoco
   glfw
@@ -58,7 +63,7 @@ add_executable(jstest src/joystick/jstest.cc src/joystick/joystick.cc)
 # --- INSTALLATION RULES ---
 # This moves the binaries to the 'lib' folder of your install workspace
 install(TARGETS
-  a2_mujoco
+  unitree_mujoco
   jstest
   DESTINATION lib/${PROJECT_NAME}
 )
