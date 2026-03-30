@@ -36,6 +36,7 @@
 #include "unitree_sdk2_bridge.h"
 #include "param.h"
 #include <ament_index_cpp/get_package_share_directory.hpp>
+#include <GLFW/glfw3.h>
 
 #define MUJOCO_PLUGIN_DIR "mujoco_plugin"
 #define NUM_MOTOR_IDL_GO 20
@@ -52,6 +53,8 @@ extern "C"
 #include <unistd.h>
 #endif
 }
+
+GLFWwindow* g_offscreen_window = nullptr;
 
 class ElasticBand
 {
@@ -646,6 +649,8 @@ void user_key_cb(GLFWwindow* window, int key, int scancode, int act, int mods) {
 int main(int argc, char **argv)
 {
 
+  setenv("MUJOCO_GL", "egl", 1);
+
   // display an error if running on macOS under Rosetta 2
 #if defined(__APPLE__) && defined(__AVX__)
   if (rosetta_error_msg)
@@ -708,6 +713,11 @@ int main(int argc, char **argv)
   auto sim = std::make_unique<mj::Simulate>(
     std::make_unique<mj::GlfwAdapter>(),
     &cam, &opt, &pert, /* is_passive = */ false);
+
+  // Create a hidden window for offscreen rendering on the bridge thread
+  GLFWwindow* main_window = static_cast<mj::GlfwAdapter*>(sim->platform_ui.get())->window_;
+  glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE);
+  g_offscreen_window = glfwCreateWindow(640, 480, "Offscreen", nullptr, main_window);
 
   std::thread unitree_thread(UnitreeSdk2BridgeThread, &sim->mtx);
 

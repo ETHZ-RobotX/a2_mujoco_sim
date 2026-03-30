@@ -1,6 +1,7 @@
 #pragma once
 
 #include <mujoco/mujoco.h>
+#include <GLFW/glfw3.h>
 
 #include <unitree/robot/channel/channel_publisher.hpp>
 #include <unitree/robot/channel/channel_subscriber.hpp>
@@ -8,6 +9,7 @@
 #include <unitree/dds_wrapper/robots/g1/g1.h>
 #include <unitree/idl/hg/BmsState_.hpp>
 #include <unitree/idl/hg/IMUState_.hpp>
+
 
 #include <iostream>
 #include <cmath>
@@ -18,12 +20,18 @@
 #include "param.h"
 #include "physics_joystick.h"
 
+extern GLFWwindow* g_offscreen_window;
+
 #define MOTOR_SENSOR_NUM 3
 
 struct LidarPoint {
     float x, y, z;
     float dist;
     float nx, ny, nz;
+};
+
+struct Pixel {
+    uint8_t r, g, b;
 };
 
 class UnitreeSDK2BridgeBase
@@ -248,6 +256,14 @@ protected:
     std::recursive_mutex* sim_mtx_;
 
     std::shared_ptr<unitree::robot::ChannelPublisher<sensor_msgs::msg::dds_::PointCloud2_>> lidar_publisher_;
+    std::shared_ptr<unitree::robot::ChannelPublisher<sensor_msgs::msg::dds_::PointCloud2_>> camera_publisher_;
+
+    // OpenGL rendering components for Camera
+    mjvScene scn_ = {};
+    mjrContext con_ = {};
+    mjvCamera front_cam_ = {};
+    mjvOption opt_ = {};
+    bool gl_initialized_ = false;
 
     // Lidar buffers
     int h_samples_ = 360;
@@ -267,6 +283,9 @@ protected:
 
     double lidar_publish_rate_ = 40.0;
     double next_lidar_time_ = 0.0;
+    double camera_publish_rate_ = 30.0;
+    double next_camera_time_ = 0.0;
+    
 
     void _check_sensor()
     {
@@ -320,6 +339,9 @@ public:
 
         lidar_publisher_ = std::make_shared<unitree::robot::ChannelPublisher<sensor_msgs::msg::dds_::PointCloud2_>>("rt/mujoco/lidar");
         lidar_publisher_->InitChannel();
+
+        camera_publisher_ = std::make_shared<unitree::robot::ChannelPublisher<sensor_msgs::msg::dds_::PointCloud2_>>("rt/mujoco/front_camera_pointcloud");
+        camera_publisher_->InitChannel();
     }
 
     void start()
@@ -494,6 +516,75 @@ public:
                 }
             }
         }
+        if (mj_data_->time >= next_camera_time_) {
+            next_camera_time_ = mj_data_->time + 1.0 / camera_publish_rate_;
+
+            int cam_id = mj_name2id(mj_model_, mjOBJ_CAMERA, "front_camera");
+
+            if (g_offscreen_window) {
+                glfwMakeContextCurrent(g_offscreen_window);
+            }
+
+            if (!gl_initialized_) {
+                // This ensures the GPU context is tied to the current bridge thread
+                mjv_defaultScene(&scn_);
+                mjv_makeScene(mj_model_, &scn_, 2000); 
+
+                mjr_defaultContext(&con_);
+                mjr_makeContext(mj_model_, &con_, mjFONTSCALE_150);
+                mjr_setBuffer(mjFB_OFFSCREEN, &con_);
+                
+                mjv_defaultOption(&opt_);
+                mjv_defaultCamera(&front_cam_);
+                
+                gl_initialized_ = true;
+                std::cout << "Camera Rendering Context Initialized in Bridge Thread." << std::endl;
+            }
+            
+            if (cam_id >= 0 && camera_publisher_) {
+                int width = 640;
+                int height = 480;
+                
+                std::vector<unsigned char> rgb_buffer(width * height * 3, 0);
+                
+                front_cam_.type = mjCAMERA_FIXED;
+                front_cam_.fixedcamid = cam_id;
+                
+                mjv_updateScene(mj_model_, mj_data_, &opt_, nullptr, &front_cam_, mjCAT_ALL, &scn_);
+                mjrRect viewport = {0, 0, width, height};
+                mjr_render(viewport, &scn_, &con_);
+                mjr_readPixels(rgb_buffer.data(), nullptr, viewport, &con_);
+
+                // 1. Initialize PointCloud2 message
+                sensor_msgs::msg::dds_::PointCloud2_ msg;
+                msg.header().frame_id() = "mujoco_front_camera_link";
+                msg.header().stamp().sec()     = static_cast<int32_t>(mj_data_->time);
+                msg.header().stamp().nanosec() = static_cast<uint32_t>((mj_data_->time - msg.header().stamp().sec()) * 1e9);
+
+                msg.height() = height;
+                msg.width() = width;
+                msg.point_step() = sizeof(Pixel); // Automatically 3
+                msg.row_step() = width * sizeof(Pixel);
+                msg.data().resize(height * msg.row_step());
+
+                // 2. Cast the buffers to our struct type for clean access
+                Pixel* dest = reinterpret_cast<Pixel*>(msg.data().data());
+                const Pixel* src = reinterpret_cast<const Pixel*>(rgb_buffer.data());
+
+                // 3. Flip and Fill
+                for (int y = 0; y < height; ++y) {
+                    int src_row = (height - 1 - y) * width;
+                    int dest_row = y * width;
+                    
+                    for (int x = 0; x < width; ++x) {
+                        dest[dest_row + x] = src[src_row + x];
+                    }
+                }
+
+                camera_publisher_->Write(msg);
+            }
+        }
+        
     }
 
     std::unique_ptr<HighState_t> highstate;
