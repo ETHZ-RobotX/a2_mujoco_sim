@@ -8,7 +8,7 @@ from launch_ros.actions import Node
 def generate_launch_description():
     # Get package directories
     description_dir = get_package_share_directory('a2_description')
-    mujoco_dir = get_package_share_directory('a2_mujoco')
+    mujoco_dir = get_package_share_directory('unitree_mujoco')
 
     # Declare arguments
     scene_arg = DeclareLaunchArgument(
@@ -28,7 +28,7 @@ def generate_launch_description():
     return LaunchDescription([
         scene_arg,
         Node(
-            package='a2_mujoco',
+            package='unitree_mujoco',
             executable='a2_mujoco',
             output='screen',
             arguments=[

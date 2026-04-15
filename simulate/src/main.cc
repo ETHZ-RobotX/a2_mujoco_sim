@@ -691,6 +691,11 @@ int main(int argc, char **argv)
   }
   param::helper(filtered_argc, argv);
 
+  // Override robot_scene if passed as a positional argument from the ROS 2 launch file
+  if (filtered_argc > 1 && argv[1][0] != '-') {
+    param::config.robot_scene = argv[1];
+  }
+
   if(param::config.robot_scene.is_relative()) {
     std::string a2_description_share = ament_index_cpp::get_package_share_directory("a2_description");
     std::filesystem::path scene_path = std::filesystem::path(a2_description_share) / "mjcf" / param::config.robot_scene;
@@ -709,6 +714,10 @@ int main(int argc, char **argv)
   auto sim = std::make_unique<mj::Simulate>(
     std::make_unique<mj::GlfwAdapter>(),
     &cam, &opt, &pert, /* is_passive = */ false);
+
+  // hide the side panels in the mujoco window
+  sim->ui0_enable = false;
+  sim->ui1_enable = false;
 
   // Create a hidden window for offscreen rendering on the bridge thread
   GLFWwindow* main_window = static_cast<mj::GlfwAdapter*>(sim->platform_ui.get())->window_;

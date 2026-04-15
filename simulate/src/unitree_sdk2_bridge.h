@@ -488,22 +488,22 @@ public:
                     msg.row_step()   = nray_ * msg.point_step();
                     msg.data().resize(msg.row_step());
 
-                    float max_distance = 10.0f;
                     LidarPoint* point_ptr = reinterpret_cast<LidarPoint*>(msg.data().data());
                     
+                    int valid_points = 0;
                     for (int i = 0; i < nray_; i++) {
                         float dist = static_cast<float>(ray_dist_[i]);
                         
                         // Handle "No Hit" or Out of Range
                         if (dist < 0 || dist > cutoff_) {
-                            dist = static_cast<float>(cutoff_);
+                            continue;
                         }
 
                         // Point position in LIDAR frame (Local Ray * Distance)
-                        point_ptr[i].x = dist * static_cast<float>(local_ray_vecs_[i*3+0]);
-                        point_ptr[i].y = dist * static_cast<float>(local_ray_vecs_[i*3+1]);
-                        point_ptr[i].z = dist * static_cast<float>(local_ray_vecs_[i*3+2]);
-                        point_ptr[i].dist = dist;
+                        point_ptr[valid_points].x = dist * static_cast<float>(local_ray_vecs_[i*3+0]);
+                        point_ptr[valid_points].y = dist * static_cast<float>(local_ray_vecs_[i*3+1]);
+                        point_ptr[valid_points].z = dist * static_cast<float>(local_ray_vecs_[i*3+2]);
+                        point_ptr[valid_points].dist = dist;
 
                         // Transform Normal from Global back to Local
                         mjtNum g_norm[3] = {ray_normal_[i*3], ray_normal_[i*3+1], ray_normal_[i*3+2]};
@@ -512,10 +512,16 @@ public:
                         // mju_mulMatTVec3 multiplies by the Transpose of site_xmat (Global -> Local)
                         mju_mulMatTVec3(l_norm, site_xmat, g_norm);
 
-                        point_ptr[i].nx = static_cast<float>(l_norm[0]);
-                        point_ptr[i].ny = static_cast<float>(l_norm[1]);
-                        point_ptr[i].nz = static_cast<float>(l_norm[2]);
+                        point_ptr[valid_points].nx = static_cast<float>(l_norm[0]);
+                        point_ptr[valid_points].ny = static_cast<float>(l_norm[1]);
+                        point_ptr[valid_points].nz = static_cast<float>(l_norm[2]);
+                        
+                        valid_points++;
                     }
+
+                    msg.width() = valid_points;
+                    msg.row_step() = valid_points * msg.point_step();
+                    msg.data().resize(msg.row_step());
 
                     front_lidar_publisher_->Write(msg);
                 }
@@ -572,22 +578,22 @@ public:
                     msg.row_step()   = nray_ * msg.point_step();
                     msg.data().resize(msg.row_step());
 
-                    float max_distance = 10.0f;
                     LidarPoint* point_ptr = reinterpret_cast<LidarPoint*>(msg.data().data());
                     
+                    int valid_points = 0;
                     for (int i = 0; i < nray_; i++) {
                         float dist = static_cast<float>(ray_dist_[i]);
                         
                         // Handle "No Hit" or Out of Range
                         if (dist < 0 || dist > cutoff_) {
-                            dist = static_cast<float>(cutoff_);
+                            continue;
                         }
 
                         // Point position in LIDAR frame (Local Ray * Distance)
-                        point_ptr[i].x = dist * static_cast<float>(local_ray_vecs_[i*3+0]);
-                        point_ptr[i].y = dist * static_cast<float>(local_ray_vecs_[i*3+1]);
-                        point_ptr[i].z = dist * static_cast<float>(local_ray_vecs_[i*3+2]);
-                        point_ptr[i].dist = dist;
+                        point_ptr[valid_points].x = dist * static_cast<float>(local_ray_vecs_[i*3+0]);
+                        point_ptr[valid_points].y = dist * static_cast<float>(local_ray_vecs_[i*3+1]);
+                        point_ptr[valid_points].z = dist * static_cast<float>(local_ray_vecs_[i*3+2]);
+                        point_ptr[valid_points].dist = dist;
 
                         // Transform Normal from Global back to Local
                         mjtNum g_norm[3] = {ray_normal_[i*3], ray_normal_[i*3+1], ray_normal_[i*3+2]};
@@ -596,10 +602,16 @@ public:
                         // mju_mulMatTVec3 multiplies by the Transpose of site_xmat (Global -> Local)
                         mju_mulMatTVec3(l_norm, site_xmat, g_norm);
 
-                        point_ptr[i].nx = static_cast<float>(l_norm[0]);
-                        point_ptr[i].ny = static_cast<float>(l_norm[1]);
-                        point_ptr[i].nz = static_cast<float>(l_norm[2]);
+                        point_ptr[valid_points].nx = static_cast<float>(l_norm[0]);
+                        point_ptr[valid_points].ny = static_cast<float>(l_norm[1]);
+                        point_ptr[valid_points].nz = static_cast<float>(l_norm[2]);
+                        
+                        valid_points++;
                     }
+
+                    msg.width() = valid_points;
+                    msg.row_step() = valid_points * msg.point_step();
+                    msg.data().resize(msg.row_step());
 
                     rear_lidar_publisher_->Write(msg);
                 }
