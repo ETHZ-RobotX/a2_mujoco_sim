@@ -16,6 +16,8 @@
 #include <vector>
 #include <cstring>
 #include <limits>
+#include <numeric>
+#include <future>
 
 #include "param.h"
 #include "physics_joystick.h"
@@ -177,12 +179,19 @@ public:
         };
         
         nray_ = h_samples_ * v_samples_;
-        ray_vecs_.resize(nray_ * 3);
         local_ray_vecs_.resize(nray_ * 3);
-        ray_geomid_.resize(nray_);
-        ray_dist_.resize(nray_);
-        ray_normal_.resize(nray_ * 3);
         
+        // Using separate output structures for the front and rear lidars
+        auto init_state = [&](LidarState& state) {
+            state.ray_vecs.resize(nray_ * 3);
+            state.ray_geomid.resize(nray_);
+            state.ray_dist.resize(nray_);
+            state.ray_normal.resize(nray_ * 3);
+        };
+        init_state(front_lidar_state_);
+        init_state(rear_lidar_state_);
+        
+        // Fill up the lidar pattern - in local frame
         double theta_step = (h_samples_ > 1)
             ? (max_theta_ - min_theta_) / (h_samples_ - 1)
             : 0.0;
@@ -277,16 +286,133 @@ protected:
     double max_phi_ = M_PI / 3.0;
 
     std::vector<mjtNum> local_ray_vecs_;
-    std::vector<mjtNum> ray_vecs_;
-    std::vector<int> ray_geomid_;
-    std::vector<mjtNum> ray_dist_;
-    std::vector<mjtNum> ray_normal_;
 
-    double lidar_publish_rate_ = 40.0;
+    // Using separate output structures for the front and rear lidars
+    struct LidarState {
+        std::vector<mjtNum> ray_vecs;
+        std::vector<int> ray_geomid;
+        std::vector<mjtNum> ray_dist;
+        std::vector<mjtNum> ray_normal;
+    };
+    LidarState front_lidar_state_;
+    LidarState rear_lidar_state_;
+
+    double lidar_publish_rate_ = 30.0;
     double next_lidar_time_ = 0.0;
     double camera_publish_rate_ = 30.0;
     double next_camera_time_ = 0.0;
-    
+
+    // struct that defines the config paramteres for each lidar
+    struct LidarConfig {
+        const char* site_name;
+        const char* frame_id;
+        std::shared_ptr<unitree::robot::ChannelPublisher<sensor_msgs::msg::dds_::PointCloud2_>> publisher;
+    };
+
+    // function that takes the output of mj_multiRay, converts it into a pointcloud and publishes it
+    void BuildAndPublishPointCloud(const LidarConfig& cfg, const LidarState& state, mjtNum* site_xmat) {
+        sensor_msgs::msg::dds_::PointCloud2_ msg;
+
+        msg.header().frame_id() = cfg.frame_id;
+        msg.header().stamp().sec()     = static_cast<int32_t>(mj_data_->time);
+        msg.header().stamp().nanosec() = static_cast<uint32_t>(
+            (mj_data_->time - msg.header().stamp().sec()) * 1e9);
+
+        msg.height()       = 1;
+        msg.width()        = nray_;
+        msg.is_dense()     = false;
+        msg.is_bigendian() = false;
+
+        msg.fields().resize(7);
+        auto set_field = [&](int idx, const std::string& name,
+                            uint32_t offset, uint8_t datatype) {
+            msg.fields()[idx].name()     = name;
+            msg.fields()[idx].offset()   = offset;
+            msg.fields()[idx].datatype() = datatype;
+            msg.fields()[idx].count()    = 1;
+        };
+        set_field(0, "x",       0,  7); // FLOAT32
+        set_field(1, "y",       4,  7);
+        set_field(2, "z",       8,  7);
+        set_field(3, "dist",   12,  7);
+        set_field(4, "nx",     16,  7);
+        set_field(5, "ny",     20,  7);
+        set_field(6, "nz",     24,  7);
+
+        msg.point_step() = 28;
+        msg.row_step()   = nray_ * msg.point_step();
+        msg.data().resize(msg.row_step());
+
+        LidarPoint* point_ptr = reinterpret_cast<LidarPoint*>(msg.data().data());
+        
+        // Point packing: use a parallel prefix-sum (scan) pattern
+        std::vector<int> valid_flags(nray_, 0);
+
+        // Find valid rays
+        #pragma omp parallel for schedule(static)
+        for (int i = 0; i < nray_; i++) {
+            float dist = static_cast<float>(state.ray_dist[i]);
+            valid_flags[i] = (dist >= 0 && dist <= cutoff_) ? 1 : 0;
+        }
+
+        // Finding total valid rays using a cumulative sum, to avoid race conditions
+        std::vector<int> write_idx(nray_ + 1, 0);
+        std::partial_sum(valid_flags.begin(), valid_flags.end(), write_idx.begin() + 1);
+        int valid_points = write_idx[nray_];
+
+        #pragma omp parallel for schedule(static)
+        for (int i = 0; i < nray_; i++) {
+            if (!valid_flags[i]) continue;
+            
+            int out = write_idx[i];
+            float dist = static_cast<float>(state.ray_dist[i]);
+
+            point_ptr[out].x = dist * static_cast<float>(local_ray_vecs_[i*3+0]);
+            point_ptr[out].y = dist * static_cast<float>(local_ray_vecs_[i*3+1]);
+            point_ptr[out].z = dist * static_cast<float>(local_ray_vecs_[i*3+2]);
+            point_ptr[out].dist = dist;
+
+            // Transform Normal from Global back to Local
+            mjtNum g_norm[3] = {state.ray_normal[i*3], state.ray_normal[i*3+1], state.ray_normal[i*3+2]};
+            mjtNum l_norm[3];
+            
+            // mju_mulMatTVec3 multiplies by the Transpose of site_xmat (Global -> Local)
+            mju_mulMatTVec3(l_norm, site_xmat, g_norm);
+
+            point_ptr[out].nx = static_cast<float>(l_norm[0]);
+            point_ptr[out].ny = static_cast<float>(l_norm[1]);
+            point_ptr[out].nz = static_cast<float>(l_norm[2]);
+        }
+
+        msg.width() = valid_points;
+        msg.row_step() = valid_points * msg.point_step();
+        msg.data().resize(msg.row_step());
+
+        cfg.publisher->Write(msg);
+    }
+
+    // function that transforms the local lidar pattern into the global frame and performs the ray casting in MuJoCo
+    void ProcessLidar(const LidarConfig& cfg, LidarState& state, int base_link_id) {
+        int body_id = mj_name2id(mj_model_, mjOBJ_SITE, cfg.site_name);
+        if (body_id < 0 || !cfg.publisher) return;
+
+        mjtNum* site_xmat = mj_data_->site_xmat + 9 * body_id;
+        mjtNum pnt[3] = {
+            mj_data_->site_xpos[3 * body_id + 0],
+            mj_data_->site_xpos[3 * body_id + 1],
+            mj_data_->site_xpos[3 * body_id + 2]
+        };
+
+        #pragma omp parallel for schedule(static)
+        for (int i = 0; i < nray_; i++) {
+            mju_mulMatVec3(state.ray_vecs.data() + 3 * i, site_xmat, local_ray_vecs_.data() + 3 * i);
+        }
+
+        mj_multiRay(mj_model_, mj_data_, pnt, state.ray_vecs.data(), nullptr, 1, base_link_id,
+                    state.ray_geomid.data(), state.ray_dist.data(), state.ray_normal.data(), nray_, cutoff_);
+
+        BuildAndPublishPointCloud(cfg, state, site_xmat);
+    }
 
     void _check_sensor()
     {
@@ -437,185 +563,18 @@ public:
             next_lidar_time_ = mj_data_->time + 1.0 / lidar_publish_rate_;
 
             int base_link_id = mj_name2id(mj_model_, mjOBJ_BODY, "base_link");
-            int body_id = mj_name2id(mj_model_, mjOBJ_SITE, "front_lidar_site");
 
-            if (body_id >= 0) {
-                mjtNum pnt[3] = {
-                    mj_data_->site_xpos[3 * body_id + 0],
-                    mj_data_->site_xpos[3 * body_id + 1],
-                    mj_data_->site_xpos[3 * body_id + 2]
-                };
+            auto front_task = std::async(std::launch::async, [&]() {
+                LidarConfig front_cfg{"front_lidar_site", "front_lidar_link", front_lidar_publisher_};
+                ProcessLidar(front_cfg, front_lidar_state_, base_link_id);
+            });
+            auto rear_task = std::async(std::launch::async, [&]() {
+                LidarConfig rear_cfg{"rear_lidar_site", "rear_lidar_link", rear_lidar_publisher_};
+                ProcessLidar(rear_cfg, rear_lidar_state_, base_link_id);
+            });
 
-                // Rotate local ray directions to global for mj_multiRay
-                mjtNum* site_xmat = mj_data_->site_xmat + 9 * body_id;
-                for (int i = 0; i < nray_; i++) {
-                    mju_mulMatVec3(ray_vecs_.data() + 3 * i, site_xmat, local_ray_vecs_.data() + 3 * i);
-                }
-
-                mj_multiRay(mj_model_, mj_data_, pnt, ray_vecs_.data(), nullptr, 1, base_link_id,
-                            ray_geomid_.data(), ray_dist_.data(), ray_normal_.data(), nray_, cutoff_);
-
-                if (front_lidar_publisher_) {
-                    sensor_msgs::msg::dds_::PointCloud2_ msg;
-
-                    msg.header().frame_id() = "front_lidar_link";
-                    msg.header().stamp().sec()     = static_cast<int32_t>(mj_data_->time);
-                    msg.header().stamp().nanosec() = static_cast<uint32_t>(
-                        (mj_data_->time - msg.header().stamp().sec()) * 1e9);
-
-                    msg.height()       = 1;
-                    msg.width()        = nray_;
-                    msg.is_dense()     = false;
-                    msg.is_bigendian() = false;
-
-                    msg.fields().resize(7);
-                    auto set_field = [&](int idx, const std::string& name,
-                                        uint32_t offset, uint8_t datatype) {
-                        msg.fields()[idx].name()     = name;
-                        msg.fields()[idx].offset()   = offset;
-                        msg.fields()[idx].datatype() = datatype;
-                        msg.fields()[idx].count()    = 1;
-                    };
-                    set_field(0, "x",       0,  7); // FLOAT32
-                    set_field(1, "y",       4,  7);
-                    set_field(2, "z",       8,  7);
-                    set_field(3, "dist",   12,  7);
-                    set_field(4, "nx",     16,  7);
-                    set_field(5, "ny",     20,  7);
-                    set_field(6, "nz",     24,  7);
-
-                    msg.point_step() = 28;
-                    msg.row_step()   = nray_ * msg.point_step();
-                    msg.data().resize(msg.row_step());
-
-                    LidarPoint* point_ptr = reinterpret_cast<LidarPoint*>(msg.data().data());
-                    
-                    int valid_points = 0;
-                    for (int i = 0; i < nray_; i++) {
-                        float dist = static_cast<float>(ray_dist_[i]);
-                        
-                        // Handle "No Hit" or Out of Range
-                        if (dist < 0 || dist > cutoff_) {
-                            continue;
-                        }
-
-                        // Point position in LIDAR frame (Local Ray * Distance)
-                        point_ptr[valid_points].x = dist * static_cast<float>(local_ray_vecs_[i*3+0]);
-                        point_ptr[valid_points].y = dist * static_cast<float>(local_ray_vecs_[i*3+1]);
-                        point_ptr[valid_points].z = dist * static_cast<float>(local_ray_vecs_[i*3+2]);
-                        point_ptr[valid_points].dist = dist;
-
-                        // Transform Normal from Global back to Local
-                        mjtNum g_norm[3] = {ray_normal_[i*3], ray_normal_[i*3+1], ray_normal_[i*3+2]};
-                        mjtNum l_norm[3];
-                        
-                        // mju_mulMatTVec3 multiplies by the Transpose of site_xmat (Global -> Local)
-                        mju_mulMatTVec3(l_norm, site_xmat, g_norm);
-
-                        point_ptr[valid_points].nx = static_cast<float>(l_norm[0]);
-                        point_ptr[valid_points].ny = static_cast<float>(l_norm[1]);
-                        point_ptr[valid_points].nz = static_cast<float>(l_norm[2]);
-                        
-                        valid_points++;
-                    }
-
-                    msg.width() = valid_points;
-                    msg.row_step() = valid_points * msg.point_step();
-                    msg.data().resize(msg.row_step());
-
-                    front_lidar_publisher_->Write(msg);
-                }
-            }
-
-            body_id = mj_name2id(mj_model_, mjOBJ_SITE, "rear_lidar_site");
-
-            if (body_id >= 0) {
-                mjtNum pnt[3] = {
-                    mj_data_->site_xpos[3 * body_id + 0],
-                    mj_data_->site_xpos[3 * body_id + 1],
-                    mj_data_->site_xpos[3 * body_id + 2]
-                };
-
-                // Rotate local ray directions to global for mj_multiRay
-                mjtNum* site_xmat = mj_data_->site_xmat + 9 * body_id;
-                for (int i = 0; i < nray_; i++) {
-                    mju_mulMatVec3(ray_vecs_.data() + 3 * i, site_xmat, local_ray_vecs_.data() + 3 * i);
-                }
-
-                mj_multiRay(mj_model_, mj_data_, pnt, ray_vecs_.data(), nullptr, 1, base_link_id,
-                            ray_geomid_.data(), ray_dist_.data(), ray_normal_.data(), nray_, cutoff_);
-
-                if (rear_lidar_publisher_) {
-                    sensor_msgs::msg::dds_::PointCloud2_ msg;
-
-                    msg.header().frame_id() = "rear_lidar_link";
-                    msg.header().stamp().sec()     = static_cast<int32_t>(mj_data_->time);
-                    msg.header().stamp().nanosec() = static_cast<uint32_t>(
-                        (mj_data_->time - msg.header().stamp().sec()) * 1e9);
-
-                    msg.height()       = 1;
-                    msg.width()        = nray_;
-                    msg.is_dense()     = false;
-                    msg.is_bigendian() = false;
-
-                    msg.fields().resize(7);
-                    auto set_field = [&](int idx, const std::string& name,
-                                        uint32_t offset, uint8_t datatype) {
-                        msg.fields()[idx].name()     = name;
-                        msg.fields()[idx].offset()   = offset;
-                        msg.fields()[idx].datatype() = datatype;
-                        msg.fields()[idx].count()    = 1;
-                    };
-                    set_field(0, "x",       0,  7); // FLOAT32
-                    set_field(1, "y",       4,  7);
-                    set_field(2, "z",       8,  7);
-                    set_field(3, "dist",   12,  7);
-                    set_field(4, "nx",     16,  7);
-                    set_field(5, "ny",     20,  7);
-                    set_field(6, "nz",     24,  7);
-
-                    msg.point_step() = 28;
-                    msg.row_step()   = nray_ * msg.point_step();
-                    msg.data().resize(msg.row_step());
-
-                    LidarPoint* point_ptr = reinterpret_cast<LidarPoint*>(msg.data().data());
-                    
-                    int valid_points = 0;
-                    for (int i = 0; i < nray_; i++) {
-                        float dist = static_cast<float>(ray_dist_[i]);
-                        
-                        // Handle "No Hit" or Out of Range
-                        if (dist < 0 || dist > cutoff_) {
-                            continue;
-                        }
-
-                        // Point position in LIDAR frame (Local Ray * Distance)
-                        point_ptr[valid_points].x = dist * static_cast<float>(local_ray_vecs_[i*3+0]);
-                        point_ptr[valid_points].y = dist * static_cast<float>(local_ray_vecs_[i*3+1]);
-                        point_ptr[valid_points].z = dist * static_cast<float>(local_ray_vecs_[i*3+2]);
-                        point_ptr[valid_points].dist = dist;
-
-                        // Transform Normal from Global back to Local
-                        mjtNum g_norm[3] = {ray_normal_[i*3], ray_normal_[i*3+1], ray_normal_[i*3+2]};
-                        mjtNum l_norm[3];
-                        
-                        // mju_mulMatTVec3 multiplies by the Transpose of site_xmat (Global -> Local)
-                        mju_mulMatTVec3(l_norm, site_xmat, g_norm);
-
-                        point_ptr[valid_points].nx = static_cast<float>(l_norm[0]);
-                        point_ptr[valid_points].ny = static_cast<float>(l_norm[1]);
-                        point_ptr[valid_points].nz = static_cast<float>(l_norm[2]);
-                        
-                        valid_points++;
-                    }
-
-                    msg.width() = valid_points;
-                    msg.row_step() = valid_points * msg.point_step();
-                    msg.data().resize(msg.row_step());
-
-                    rear_lidar_publisher_->Write(msg);
-                }
-            }
+            front_task.get();
+            rear_task.get();
         }
         if (mj_data_->time >= next_camera_time_) {
             next_camera_time_ = mj_data_->time + 1.0 / camera_publish_rate_;
