@@ -24,6 +24,7 @@
 #include <cstring>
 #include <iostream>
 #include <memory>
+#include <iomanip>
 #include <mutex>
 #include <new>
 #include <string>
@@ -336,6 +337,9 @@ namespace
     std::chrono::time_point<mj::Simulate::Clock> syncCPU;
     mjtNum syncSim = 0;
 
+    auto last_fps_time = std::chrono::steady_clock::now();
+    int physics_step_count = 0;
+
     // ChannelFactory::Instance()->Init(0);
     // UnitreeDds ud(d);
 
@@ -408,6 +412,17 @@ namespace
 
       ///////////////////////////////////////////////////////////////////////////////////////////
 
+      bool is_headless = false;
+      if (const char* env_p = std::getenv("HEADLESS")) {
+        std::string env_s(env_p);
+        if (env_s == "1" || env_s == "true" || env_s == "TRUE" || env_s == "True") {
+          is_headless = true;
+        }
+      }
+      if (m && d && is_headless && sim.run == 0) {
+        sim.run = 1;
+      }
+
       // sleep for 1 ms or yield, to let main thread run
       //  yield results in busy wait - which has better timing but kills battery life
       if (sim.run && sim.busywait)
@@ -423,7 +438,18 @@ namespace
       {
         // lock the sim mutex
         // mutex protects the model m and data d
-        const std::unique_lock<std::recursive_mutex> lock(sim.mtx);
+        std::unique_lock<std::recursive_mutex> lock(sim.mtx);
+
+        // TEMP DEBUG - add this
+        static int debug_count = 0;
+        if (debug_count < 5) {
+            std::cout << "[DEBUG] loop iter " << debug_count 
+                      << " m=" << (m ? "yes" : "null")
+                      << " sim.run=" << sim.run 
+                      << " d_time=" << (d ? d->time : -1.0)
+                      << std::endl;
+            debug_count++;
+        }
 
         // run only if model is present
         if (m)
@@ -432,6 +458,13 @@ namespace
           // checks if sim is paused through spacebar, 0 if paused 1 if running
           if (sim.run)
           {
+            // TEMP DEBUG
+            static bool first_step = true;
+            if (first_step) {
+                std::cout << "[DEBUG] first mj_step called, time=" << d->time << std::endl;
+                first_step = false;
+            }
+
             bool stepped = false;
 
             // record cpu time at start of iteration
@@ -486,7 +519,7 @@ namespace
             else
             {
               // elastic band on base link
-              if (param::config.enable_elastic_band == 1)
+              if (param::config.enable_elastic_band == 1 && param::config.band_attached_link >= 0)
               {
                 if (elastic_band.enable_)
                 {
@@ -510,7 +543,9 @@ namespace
                                 - Seconds(mj::Simulate::Clock::now() - syncCPU).count();
               if (simAhead > 0)
               {
+                lock.unlock();
                 std::this_thread::sleep_for(Seconds(simAhead));
+                lock.lock();
               }
             }
 
@@ -518,6 +553,7 @@ namespace
             if (stepped)
             {
               sim.AddToHistory();
+              physics_step_count++;
             }
             
           }
@@ -531,6 +567,18 @@ namespace
           }
         }
       } // release std::lock_guard<std::mutex>
+
+      // FPS tracking
+      auto now_time = std::chrono::steady_clock::now();
+      std::chrono::duration<double> elapsed = now_time - last_fps_time;
+      if (elapsed.count() >= 1.0) {
+        const double physics_fps = physics_step_count / elapsed.count();
+        physics_step_count = 0;
+        last_fps_time = now_time;
+
+        std::cout << std::fixed << std::setprecision(1)
+                  << "[Frequencies] Physics: " << physics_fps << " Hz" << std::endl;
+      }
     }
   }
 } // namespace
@@ -548,13 +596,27 @@ void PhysicsThread(mj::Simulate *sim, const char *filename)
       d = mj_makeData(m);
     if (d)
     {
-      sim->Load(m, d, filename);
+      bool is_headless = false;
+      if (const char* env_p = std::getenv("HEADLESS")) {
+        std::string env_s(env_p);
+        if (env_s == "1" || env_s == "true" || env_s == "TRUE" || env_s == "True") {
+          is_headless = true;
+        }
+      }
+
+      if (!is_headless) {
+        sim->Load(m, d, filename);
+      }
       mj_forward(m, d);
 
       // allocate ctrlnoise
       free(ctrlnoise);
       ctrlnoise = static_cast<mjtNum *>(malloc(sizeof(mjtNum) * m->nu));
       mju_zero(ctrlnoise, m->nu);
+
+      if (is_headless) {
+        sim->run = 1;
+      }
     }
     else
     {
@@ -593,7 +655,11 @@ void *UnitreeSdk2BridgeThread(void *arg)
   if (body_id < 0) {
     body_id = mj_name2id(m, mjOBJ_BODY, "base_link");
   }
-  param::config.band_attached_link = 6 * body_id;
+  if (body_id >= 0) {
+    param::config.band_attached_link = 6 * body_id;
+  } else {
+    param::config.band_attached_link = -1;
+  }
   
   std::unique_ptr<UnitreeSDK2BridgeBase> interface = nullptr;
   if (m->nu > NUM_MOTOR_IDL_GO) {
@@ -730,7 +796,28 @@ int main(int argc, char **argv)
   std::thread physicsthreadhandle(&PhysicsThread, sim.get(), param::config.robot_scene.c_str());
   // start simulation UI loop (blocking call)
   glfwSetKeyCallback(static_cast<mj::GlfwAdapter*>(sim->platform_ui.get())->window_,user_key_cb);
-  sim->RenderLoop();
+
+  // Headless mode check
+  bool is_headless = false;
+  if (const char* env_p = std::getenv("HEADLESS")) {
+    std::string env_s(env_p);
+    if (env_s == "1" || env_s == "true" || env_s == "TRUE" || env_s == "True") {
+      is_headless = true;
+    }
+  }
+
+  if (is_headless) {
+    std::cout << "[MuJoCo] Running in headless mode (Main GUI hidden)." << std::endl;
+    glfwHideWindow(main_window);
+    
+    while (!sim->exitrequest.load()) {
+      glfwPollEvents(); // Keep processing events for offscreen contexts
+      std::this_thread::sleep_for(std::chrono::milliseconds(16)); // ~60Hz
+    }
+  } else {
+    sim->RenderLoop();
+  }
+
   physicsthreadhandle.join();
 
   pthread_exit(NULL);

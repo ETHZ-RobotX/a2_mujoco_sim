@@ -493,6 +493,12 @@ protected:
         std::partial_sum(valid_flags.begin(), valid_flags.end(), write_idx.begin() + 1);
         int valid_points = write_idx[nray_];
 
+        std::cout << "[DEBUG] Lidar '" << cfg.site_name << "' valid points: " << valid_points << " / " << nray_ << std::endl;
+
+        if (valid_points == 0) {
+            return; // Avoid publishing empty pointclouds which can break DDS serialization
+        }
+
         #pragma omp parallel for schedule(static)
         for (int i = 0; i < nray_; i++) {
             if (!valid_flags[i]) continue;
@@ -527,6 +533,13 @@ protected:
     // function that transforms the local lidar pattern into the global frame and performs the ray casting in MuJoCo
     void ProcessLidar(const LidarConfig& cfg, LidarState& state, int base_link_id) {
         int body_id = mj_name2id(mj_model_, mjOBJ_SITE, cfg.site_name);
+
+        if (body_id < 0) {
+            std::cout << "[DEBUG] ProcessLidar aborted: site '" << cfg.site_name << "' not found in MJCF." << std::endl;
+        }
+        if (!cfg.publisher) {
+            std::cout << "[DEBUG] ProcessLidar aborted: publisher for '" << cfg.site_name << "' is null." << std::endl;
+        }
         if (body_id < 0 || !cfg.publisher) return;
 
         mjtNum* site_xmat = mj_data_->site_xmat + 9 * body_id;
@@ -615,6 +628,16 @@ public:
 
     virtual void run()
     {
+        // TEMP DEBUG
+        static int bridge_count = 0;
+        if (bridge_count < 5) {
+            std::cout << "[DEBUG] bridge run() iter " << bridge_count
+                      << " time=" << (mj_data_ ? mj_data_->time : -1.0)
+                      << " next_lidar=" << next_lidar_time_
+                      << std::endl;
+            bridge_count++;
+        }
+
         if(!mj_data_) return;
         if(lowstate->joystick) { lowstate->joystick->update(); }
 
@@ -644,6 +667,14 @@ public:
                 lowstate->msg_.imu_state().quaternion()[1] = mj_data_->sensordata[imu_quat_adr_ + 1];
                 lowstate->msg_.imu_state().quaternion()[2] = mj_data_->sensordata[imu_quat_adr_ + 2];
                 lowstate->msg_.imu_state().quaternion()[3] = mj_data_->sensordata[imu_quat_adr_ + 3];
+
+                // Prevent uninitialized zero-quaternion from causing NaN in TF during HEADLESS=1 startup
+                if (lowstate->msg_.imu_state().quaternion()[0] == 0.0 &&
+                    lowstate->msg_.imu_state().quaternion()[1] == 0.0 &&
+                    lowstate->msg_.imu_state().quaternion()[2] == 0.0 &&
+                    lowstate->msg_.imu_state().quaternion()[3] == 0.0) {
+                    lowstate->msg_.imu_state().quaternion()[0] = 1.0;
+                }
 
                 double w = lowstate->msg_.imu_state().quaternion()[0];
                 double x = lowstate->msg_.imu_state().quaternion()[1];
@@ -692,83 +723,110 @@ public:
         }
 
         // ---- Lidar Raycasting ----
-        if (mj_data_->time >= next_lidar_time_) {
+        static int lidar_debug_throttle = 0;
+        if (lidar_debug_throttle++ % 1000 == 0) {
+            std::cout << "[DEBUG] Lidar timing check: d->time=" << mj_data_->time 
+                      << " next_lidar=" << next_lidar_time_ << std::endl;
+        }
+
+        if (mj_data_->time > 0.0 && mj_data_->time >= next_lidar_time_) {
             next_lidar_time_ = mj_data_->time + 1.0 / lidar_publish_rate_;
 
             int base_link_id = mj_name2id(mj_model_, mjOBJ_BODY, "base_link");
+            std::cout << "[DEBUG] Firing Lidar raycasting. base_link_id=" << base_link_id << std::endl;
 
             LidarConfig front_cfg{"front_lidar_site", "front_lidar_link", front_lidar_publisher_};
             ProcessLidar(front_cfg, front_lidar_state_, base_link_id);
 
-            // LidarConfig rear_cfg{"rear_lidar_site", "rear_lidar_link", rear_lidar_publisher_};
-            // ProcessLidar(rear_cfg, rear_lidar_state_, base_link_id);
+            LidarConfig rear_cfg{"rear_lidar_site", "rear_lidar_link", rear_lidar_publisher_};
+            ProcessLidar(rear_cfg, rear_lidar_state_, base_link_id);
         }
         if (mj_data_->time >= next_camera_time_) {
             next_camera_time_ = mj_data_->time + 1.0 / camera_publish_rate_;
 
             int cam_id = mj_name2id(mj_model_, mjOBJ_CAMERA, "front_camera");
+            
+            static bool camera_debug_printed = false;
+            if (cam_id < 0 && !camera_debug_printed) {
+                std::cout << "[DEBUG] Camera 'front_camera' not found in MJCF!" << std::endl;
+                camera_debug_printed = true;
+            }
+            
+            bool is_headless = false;
+            if (const char* env_p = std::getenv("HEADLESS")) {
+                std::string env_s(env_p);
+                if (env_s == "1" || env_s == "true" || env_s == "TRUE" || env_s == "True") {
+                    is_headless = true;
+                }
+            }
+
+            static bool window_debug_printed = false;
+            if (!g_offscreen_window && !window_debug_printed) {
+                std::cout << "[DEBUG] Camera rendering aborted: g_offscreen_window is null (GLFW failed to create window in headless mode)." << std::endl;
+                window_debug_printed = true;
+            }
 
             if (g_offscreen_window) {
                 glfwMakeContextCurrent(g_offscreen_window);
-            }
 
-            if (!gl_initialized_) {
-                // This ensures the GPU context is tied to the current bridge thread
-                mjv_defaultScene(&scn_);
-                mjv_makeScene(mj_model_, &scn_, 2000); 
+                if (!gl_initialized_) {
+                    // This ensures the GPU context is tied to the current bridge thread
+                    mjv_defaultScene(&scn_);
+                    mjv_makeScene(mj_model_, &scn_, 2000); 
 
-                mjr_defaultContext(&con_);
-                mjr_makeContext(mj_model_, &con_, mjFONTSCALE_150);
-                mjr_setBuffer(mjFB_OFFSCREEN, &con_);
-                
-                mjv_defaultOption(&opt_);
-                mjv_defaultCamera(&front_cam_);
-                
-                gl_initialized_ = true;
-                std::cout << "Camera Rendering Context Initialized in Bridge Thread." << std::endl;
-            }
-            
-            if (cam_id >= 0 && camera_publisher_) {
-                int width = 640;
-                int height = 480;
-                
-                std::vector<unsigned char> rgb_buffer(width * height * 3, 0);
-                
-                front_cam_.type = mjCAMERA_FIXED;
-                front_cam_.fixedcamid = cam_id;
-                
-                mjv_updateScene(mj_model_, mj_data_, &opt_, nullptr, &front_cam_, mjCAT_ALL, &scn_);
-                mjrRect viewport = {0, 0, width, height};
-                mjr_render(viewport, &scn_, &con_);
-                mjr_readPixels(rgb_buffer.data(), nullptr, viewport, &con_);
-
-                // 1. Initialize PointCloud2 message
-                sensor_msgs::msg::dds_::PointCloud2_ msg;
-                msg.header().frame_id() = "mujoco_front_camera_link";
-                msg.header().stamp().sec()     = static_cast<int32_t>(mj_data_->time);
-                msg.header().stamp().nanosec() = static_cast<uint32_t>((mj_data_->time - msg.header().stamp().sec()) * 1e9);
-
-                msg.height() = height;
-                msg.width() = width;
-                msg.point_step() = sizeof(Pixel); // Automatically 3
-                msg.row_step() = width * sizeof(Pixel);
-                msg.data().resize(height * msg.row_step());
-
-                // 2. Cast the buffers to our struct type for clean access
-                Pixel* dest = reinterpret_cast<Pixel*>(msg.data().data());
-                const Pixel* src = reinterpret_cast<const Pixel*>(rgb_buffer.data());
-
-                // 3. Flip and Fill
-                for (int y = 0; y < height; ++y) {
-                    int src_row = (height - 1 - y) * width;
-                    int dest_row = y * width;
+                    mjr_defaultContext(&con_);
+                    mjr_makeContext(mj_model_, &con_, mjFONTSCALE_150);
+                    mjr_setBuffer(mjFB_OFFSCREEN, &con_);
                     
-                    for (int x = 0; x < width; ++x) {
-                        dest[dest_row + x] = src[src_row + x];
-                    }
+                    mjv_defaultOption(&opt_);
+                    mjv_defaultCamera(&front_cam_);
+                    
+                    gl_initialized_ = true;
+                    std::cout << "Camera Rendering Context Initialized in Bridge Thread." << std::endl;
                 }
+                
+                if (cam_id >= 0 && camera_publisher_) {
+                    int width = 640;
+                    int height = 480;
+                    
+                    std::vector<unsigned char> rgb_buffer(width * height * 3, 0);
+                    
+                    front_cam_.type = mjCAMERA_FIXED;
+                    front_cam_.fixedcamid = cam_id;
+                    
+                    mjv_updateScene(mj_model_, mj_data_, &opt_, nullptr, &front_cam_, mjCAT_ALL, &scn_);
+                    mjrRect viewport = {0, 0, width, height};
+                    mjr_render(viewport, &scn_, &con_);
+                    mjr_readPixels(rgb_buffer.data(), nullptr, viewport, &con_);
 
-                camera_publisher_->Write(msg);
+                    // 1. Initialize PointCloud2 message
+                    sensor_msgs::msg::dds_::PointCloud2_ msg;
+                    msg.header().frame_id() = "mujoco_front_camera_link";
+                    msg.header().stamp().sec()     = static_cast<int32_t>(mj_data_->time);
+                    msg.header().stamp().nanosec() = static_cast<uint32_t>((mj_data_->time - msg.header().stamp().sec()) * 1e9);
+
+                    msg.height() = height;
+                    msg.width() = width;
+                    msg.point_step() = sizeof(Pixel); // Automatically 3
+                    msg.row_step() = width * sizeof(Pixel);
+                    msg.data().resize(height * msg.row_step());
+
+                    // 2. Cast the buffers to our struct type for clean access
+                    Pixel* dest = reinterpret_cast<Pixel*>(msg.data().data());
+                    const Pixel* src = reinterpret_cast<const Pixel*>(rgb_buffer.data());
+
+                    // 3. Flip and Fill
+                    for (int y = 0; y < height; ++y) {
+                        int src_row = (height - 1 - y) * width;
+                        int dest_row = y * width;
+                        
+                        for (int x = 0; x < width; ++x) {
+                            dest[dest_row + x] = src[src_row + x];
+                        }
+                    }
+
+                    camera_publisher_->Write(msg);
+                }
             }
         }
         
@@ -817,6 +875,14 @@ public:
                 secondary_imustate->msg_.quaternion()[1] = mj_data_->sensordata[secondary_imu_quat_adr_ + 1];
                 secondary_imustate->msg_.quaternion()[2] = mj_data_->sensordata[secondary_imu_quat_adr_ + 2];
                 secondary_imustate->msg_.quaternion()[3] = mj_data_->sensordata[secondary_imu_quat_adr_ + 3];
+
+                // Prevent uninitialized zero-quaternion from causing NaN in TF during HEADLESS=1 startup
+                if (secondary_imustate->msg_.quaternion()[0] == 0.0 &&
+                    secondary_imustate->msg_.quaternion()[1] == 0.0 &&
+                    secondary_imustate->msg_.quaternion()[2] == 0.0 &&
+                    secondary_imustate->msg_.quaternion()[3] == 0.0) {
+                    secondary_imustate->msg_.quaternion()[0] = 1.0;
+                }
 
                 double w = secondary_imustate->msg_.quaternion()[0];
                 double x = secondary_imustate->msg_.quaternion()[1];
