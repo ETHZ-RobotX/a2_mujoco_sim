@@ -430,9 +430,9 @@ protected:
     LidarState front_lidar_state_;
     LidarState rear_lidar_state_;
 
-    double lidar_publish_rate_ = 30.0;
+    double lidar_publish_rate_ = 10.0;
     double next_lidar_time_ = 0.0;
-    double camera_publish_rate_ = 30.0;
+    double camera_publish_rate_ = 10.0;
     double next_camera_time_ = 0.0;
 
     // struct that defines the config paramteres for each lidar
