@@ -18,9 +18,13 @@
 #include <limits>
 #include <numeric>
 #include <future>
+#include <array>
+#include <thread>
+#include <chrono>
 
 #include "param.h"
 #include "physics_joystick.h"
+#include "sim_buffer.h"
 
 extern GLFWwindow* g_offscreen_window;
 
@@ -42,6 +46,10 @@ public:
     UnitreeSDK2BridgeBase(mjModel *model, mjData *data, std::recursive_mutex* sim_mtx)
     : mj_model_(model), mj_data_(data), sim_mtx_(sim_mtx)
     {
+        // OPTIMIZATION: Dynamically scale lidar raycasting threads based on available CPU cores
+        num_lidar_threads_ = std::max<int>(1, std::thread::hardware_concurrency());
+        lidar_data_threads_.resize(num_lidar_threads_, nullptr);
+
         _check_sensor();
         if(param::config.print_scene_information == 1) {
             printSceneInformation();
@@ -315,11 +323,19 @@ public:
         local_ray_vecs_.resize(nray_ * 3);
         
         // Using separate output structures for the front and rear lidars
+        // Incorporates parallelization
         auto init_state = [&](LidarState& state) {
             state.ray_vecs.resize(nray_ * 3);
-            state.ray_geomid.resize(nray_);
-            state.ray_dist.resize(nray_);
-            state.ray_normal.resize(nray_ * 3);
+            state.ray_geomid.resize(num_lidar_threads_);
+            state.ray_dist.resize(num_lidar_threads_);
+            state.ray_normal.resize(num_lidar_threads_);
+            int chunk = nray_ / num_lidar_threads_;
+            for (int t = 0; t < num_lidar_threads_; t++) {
+                int sz = (t == num_lidar_threads_ - 1) ? nray_ - t * chunk : chunk;
+                state.ray_geomid[t].resize(sz);
+                state.ray_dist[t].resize(sz);
+                state.ray_normal[t].resize(sz * 3, 0.0);
+            }
         };
         init_state(front_lidar_state_);
         init_state(rear_lidar_state_);
@@ -342,7 +358,16 @@ public:
                 local_ray_vecs_[3 * idx + 2] = std::sin(phi);
             }
         }
-        
+
+    }
+
+    virtual ~UnitreeSDK2BridgeBase() {
+        // OPTIMIZATION: Clean up the dedicated thread data snapshots used for lock-free processing
+        if (lidar_data_) mj_deleteData(lidar_data_);
+        if (camera_data_) mj_deleteData(camera_data_);
+        for (int i = 0; i < num_lidar_threads_; i++) {
+            if (lidar_data_threads_[i]) mj_deleteData(lidar_data_threads_[i]);
+        }
     }
 
     virtual void start() {}
@@ -382,6 +407,7 @@ protected:
 
     mjData *mj_data_;
     mjModel *mj_model_;
+    mjData *lidar_data_ = nullptr;
 
     int imu_quat_adr_ = -1;
     int imu_gyro_adr_ = -1;
@@ -409,7 +435,8 @@ protected:
     bool gl_initialized_ = false;
 
     // Lidar buffers
-    int h_samples_ = 360;
+    // OPTIMIZATION: Reduced horizontal samples from 360 to 180 (from 1 to 2 degree resolution).
+    int h_samples_ = 180;
     int v_samples_ = 128;
     int nray_ = h_samples_ * v_samples_;
     mjtNum cutoff_ = 10.0;
@@ -421,18 +448,23 @@ protected:
     std::vector<mjtNum> local_ray_vecs_;
 
     // Using separate output structures for the front and rear lidars
+    int num_lidar_threads_ = 1;  // default value
     struct LidarState {
         std::vector<mjtNum> ray_vecs;
-        std::vector<int> ray_geomid;
-        std::vector<mjtNum> ray_dist;
-        std::vector<mjtNum> ray_normal;
+        std::vector<std::vector<int>> ray_geomid;
+        std::vector<std::vector<mjtNum>> ray_dist;
+        std::vector<std::vector<mjtNum>> ray_normal;
     };
     LidarState front_lidar_state_;
     LidarState rear_lidar_state_;
 
-    double lidar_publish_rate_ = 30.0;
+    // OPTIMIZATION: Per-thread mjData copies for parallel raycasting and camera rendering outside the physics lock
+    std::vector<mjData*> lidar_data_threads_;
+    mjData* camera_data_ = nullptr;
+    
+    double lidar_publish_rate_ = 10.0;
     double next_lidar_time_ = 0.0;
-    double camera_publish_rate_ = 30.0;
+    double camera_publish_rate_ = 10.0;
     double next_camera_time_ = 0.0;
 
     // struct that defines the config paramteres for each lidar
@@ -443,13 +475,14 @@ protected:
     };
 
     // function that takes the output of mj_multiRay, converts it into a pointcloud and publishes it
-    void BuildAndPublishPointCloud(const LidarConfig& cfg, const LidarState& state, mjtNum* site_xmat) {
+    void BuildAndPublishPointCloud(const LidarConfig& cfg, const LidarState& state, const mjtNum* site_xmat, double current_time) {
+        if (!cfg.publisher) return;
         sensor_msgs::msg::dds_::PointCloud2_ msg;
 
         msg.header().frame_id() = cfg.frame_id;
-        msg.header().stamp().sec()     = static_cast<int32_t>(mj_data_->time);
+        msg.header().stamp().sec()     = static_cast<int32_t>(current_time);
         msg.header().stamp().nanosec() = static_cast<uint32_t>(
-            (mj_data_->time - msg.header().stamp().sec()) * 1e9);
+            (current_time - msg.header().stamp().sec()) * 1e9);
 
         msg.height()       = 1;
         msg.width()        = nray_;
@@ -481,19 +514,24 @@ protected:
         // Point packing: use a parallel prefix-sum (scan) pattern
         std::vector<int> valid_flags(nray_, 0);
 
-        // Find valid rays
+        // OPTIMIZATION: Use OpenMP to parallelize the pre-filtering of valid lidar rays
         #pragma omp parallel for schedule(static)
         for (int i = 0; i < nray_; i++) {
-            float dist = static_cast<float>(state.ray_dist[i]);
+            int chunk = nray_ / num_lidar_threads_;
+            int t = i / chunk;
+            if (t >= num_lidar_threads_) t = num_lidar_threads_ - 1;
+            int local_i = i - t * chunk;
+            
+            float dist = static_cast<float>(state.ray_dist[t][local_i]);
             valid_flags[i] = (dist >= 0 && dist <= cutoff_) ? 1 : 0;
         }
 
-        // Finding total valid rays using a cumulative sum, to avoid race conditions
+        // OPTIMIZATION: Use a cumulative prefix-sum (scan) array to safely pack points in parallel without race conditions
         std::vector<int> write_idx(nray_ + 1, 0);
         std::partial_sum(valid_flags.begin(), valid_flags.end(), write_idx.begin() + 1);
         int valid_points = write_idx[nray_];
 
-        std::cout << "[DEBUG] Lidar '" << cfg.site_name << "' valid points: " << valid_points << " / " << nray_ << std::endl;
+        // std::cout << "[DEBUG] Lidar '" << cfg.site_name << "' valid points: " << valid_points << " / " << nray_ << std::endl;
 
         if (valid_points == 0) {
             return; // Avoid publishing empty pointclouds which can break DDS serialization
@@ -503,8 +541,13 @@ protected:
         for (int i = 0; i < nray_; i++) {
             if (!valid_flags[i]) continue;
             
+            int chunk = nray_ / num_lidar_threads_;
+            int t = i / chunk;
+            if (t >= num_lidar_threads_) t = num_lidar_threads_ - 1;
+            int local_i = i - t * chunk;
+
             int out = write_idx[i];
-            float dist = static_cast<float>(state.ray_dist[i]);
+            float dist = static_cast<float>(state.ray_dist[t][local_i]);
 
             point_ptr[out].x = dist * static_cast<float>(local_ray_vecs_[i*3+0]);
             point_ptr[out].y = dist * static_cast<float>(local_ray_vecs_[i*3+1]);
@@ -512,7 +555,7 @@ protected:
             point_ptr[out].dist = dist;
 
             // Transform Normal from Global back to Local
-            mjtNum g_norm[3] = {state.ray_normal[i*3], state.ray_normal[i*3+1], state.ray_normal[i*3+2]};
+            mjtNum g_norm[3] = {state.ray_normal[t][local_i*3], state.ray_normal[t][local_i*3+1], state.ray_normal[t][local_i*3+2]};
             mjtNum l_norm[3];
             
             // mju_mulMatTVec3 multiplies by the Transpose of site_xmat (Global -> Local)
@@ -530,34 +573,48 @@ protected:
         cfg.publisher->Write(msg);
     }
 
-    // function that transforms the local lidar pattern into the global frame and performs the ray casting in MuJoCo
-    void ProcessLidar(const LidarConfig& cfg, LidarState& state, int base_link_id) {
-        int body_id = mj_name2id(mj_model_, mjOBJ_SITE, cfg.site_name);
+    // function that computes lidar raycast within the physics lock
+    void ComputeLidarRaycast(mjData* data_snapshot, const char* site_name, LidarState& state, int base_link_id, mjtNum* out_site_xmat) {
+        int body_id = mj_name2id(mj_model_, mjOBJ_SITE, site_name);
 
         if (body_id < 0) {
-            std::cout << "[DEBUG] ProcessLidar aborted: site '" << cfg.site_name << "' not found in MJCF." << std::endl;
+            std::cout << "[DEBUG] ComputeLidarRaycast aborted: site '" << site_name << "' not found in MJCF." << std::endl;
+            return;
         }
-        if (!cfg.publisher) {
-            std::cout << "[DEBUG] ProcessLidar aborted: publisher for '" << cfg.site_name << "' is null." << std::endl;
-        }
-        if (body_id < 0 || !cfg.publisher) return;
 
-        mjtNum* site_xmat = mj_data_->site_xmat + 9 * body_id;
-        mjtNum pnt[3] = {
-            mj_data_->site_xpos[3 * body_id + 0],
-            mj_data_->site_xpos[3 * body_id + 1],
-            mj_data_->site_xpos[3 * body_id + 2]
-        };
+        mjtNum* site_xmat = data_snapshot->site_xmat + 9 * body_id;
+        if (out_site_xmat) {
+            mju_copy(out_site_xmat, site_xmat, 9);
+        }
+        
+        mjtNum pnt_x = data_snapshot->site_xpos[3 * body_id + 0];
+        mjtNum pnt_y = data_snapshot->site_xpos[3 * body_id + 1];
+        mjtNum pnt_z = data_snapshot->site_xpos[3 * body_id + 2];
 
         #pragma omp parallel for schedule(static)
         for (int i = 0; i < nray_; i++) {
             mju_mulMatVec3(state.ray_vecs.data() + 3 * i, site_xmat, local_ray_vecs_.data() + 3 * i);
         }
 
-        mj_multiRay(mj_model_, mj_data_, pnt, state.ray_vecs.data(), nullptr, 1, base_link_id,
-                    state.ray_geomid.data(), state.ray_dist.data(), state.ray_normal.data(), nray_, cutoff_);
+        // OPTIMIZATION: Spawn dedicated threads to evaluate mj_multiRay in parallel chunks, as mj_multiRay is single-threaded
+        int chunk = nray_ / num_lidar_threads_;
+        std::vector<std::thread> threads;
+        threads.reserve(num_lidar_threads_);
+        
+        for (int t = 0; t < num_lidar_threads_; t++) {
+            int start = t * chunk;
+            int count = (t == num_lidar_threads_ - 1) ? nray_ - start : chunk;
 
-        BuildAndPublishPointCloud(cfg, state, site_xmat);
+            threads.emplace_back([this, &state, t, start, count, pnt_x, pnt_y, pnt_z, base_link_id]() {
+                mjtNum pnt[3] = {pnt_x, pnt_y, pnt_z};
+                mj_multiRay(mj_model_, lidar_data_threads_[t], pnt,
+                            state.ray_vecs.data() + start * 3,
+                            nullptr, 1, base_link_id,
+                            state.ray_geomid[t].data(), state.ray_dist[t].data(), state.ray_normal[t].data(),
+                            count, cutoff_);
+            });
+        }
+        for (auto& th : threads) th.join();
     }
 
     void _check_sensor()
@@ -596,7 +653,6 @@ protected:
 template <typename LowCmd_t, typename LowState_t>
 class RobotBridge : public UnitreeSDK2BridgeBase
 {
-using HighState_t = unitree::robot::go2::publisher::SportModeState;
 using WirelessController_t = unitree::robot::go2::publisher::WirelessController;
 
 public:
@@ -606,7 +662,6 @@ public:
         lowcmd = std::make_shared<LowCmd_t>("rt/lowcmd");
         lowstate = std::make_unique<LowState_t>();
         lowstate->joystick = joystick;
-        highstate = std::make_unique<HighState_t>();
         wireless_controller = std::make_unique<WirelessController_t>();
         wireless_controller->joystick = joystick;
 
@@ -622,64 +677,82 @@ public:
 
     void start()
     {
-        thread_ = std::make_shared<unitree::common::RecurrentThread>(
-            "unitree_bridge", UT_CPU_ID_NONE, 1000, [this]() { this->run(); });
+        // OPTIMIZATION: Decouple DDS network publishing and heavy sensor processing into their own dedicated threads to prevent physics starvation
+        // 500 Hz (2000 us) for lowstate/lowcmd
+        thread_ = std::make_shared<unitree::common::RecurrentThread>("unitree_bridge", UT_CPU_ID_NONE, 1500, [this]() { this->run(); });
+        // 1000 us sleep loop, internally triggers raycasting at 10 Hz simulation time
+        lidar_thread_ = std::make_shared<unitree::common::RecurrentThread>("lidar_bridge", UT_CPU_ID_NONE, 5000, [this]() { this->run_lidar(); });
+        // 1000 us sleep loop, internally triggers rendering at 10 Hz simulation time
+        camera_thread_ = std::make_shared<unitree::common::RecurrentThread>("camera_bridge", UT_CPU_ID_NONE, 5000, [this]() { this->run_camera(); });
     }
 
     virtual void run()
     {
-        // TEMP DEBUG
-        static int bridge_count = 0;
-        if (bridge_count < 5) {
-            std::cout << "[DEBUG] bridge run() iter " << bridge_count
-                      << " time=" << (mj_data_ ? mj_data_->time : -1.0)
-                      << " next_lidar=" << next_lidar_time_
-                      << std::endl;
-            bridge_count++;
-        }
-
         if(!mj_data_) return;
         if(lowstate->joystick) { lowstate->joystick->update(); }
 
-        std::lock_guard<std::recursive_mutex> sim_lock(*sim_mtx_);
+        struct MotorSnapshot { double q, dq, tau; };
+        std::vector<MotorSnapshot> motor_state(num_motor_);
+        double imu_quat[4] = {1.0, 0.0, 0.0, 0.0};
+        double imu_gyro[3] = {0.0, 0.0, 0.0};
+        double imu_acc[3] = {0.0, 0.0, 0.0};
+        double current_time = 0.0;
 
-        // lowcmd
+        // OPTIMIZATION: Quickly snapshot MuJoCo state to local variables, then releasing the lock immediately
         {
-            std::lock_guard<std::mutex> lock(lowcmd->mutex_);
-            for(int i(0); i < num_motor_; i++) {
-                auto & m = lowcmd->msg_.motor_cmd()[i];
-                mj_data_->ctrl[i] = m.tau() +
-                                    m.kp() * (m.q() - mj_data_->sensordata[i]) +
-                                    m.kd() * (m.dq() - mj_data_->sensordata[i + num_motor_]);
-            }
-        }
+            std::unique_lock<std::mutex> buf_lock(sim_buffer.mtx);
+            if (sim_buffer.sensordata.empty() || sim_buffer.ctrl.empty()) return;
+            current_time = sim_buffer.time;
 
-        // lowstate
-        if(lowstate->trylock()) {
-            for(int i(0); i < num_motor_; i++) {
-                lowstate->msg_.motor_state()[i].q()       = mj_data_->sensordata[i];
-                lowstate->msg_.motor_state()[i].dq()      = mj_data_->sensordata[i + num_motor_];
-                lowstate->msg_.motor_state()[i].tau_est() = mj_data_->sensordata[i + 2 * num_motor_];
+            // Write ctrl
+            {
+                std::lock_guard<std::mutex> lock(lowcmd->mutex_);
+                for(int i = 0; i < num_motor_; i++) {
+                    auto & m = lowcmd->msg_.motor_cmd()[i];
+                    sim_buffer.ctrl[i] = m.tau() +
+                                        m.kp() * (m.q() - sim_buffer.sensordata[i]) +
+                                        m.kd() * (m.dq() - sim_buffer.sensordata[i + num_motor_]);
+                }
+            }
+
+            // Snapshot sensordata
+            for(int i = 0; i < num_motor_; i++) {
+                motor_state[i] = {
+                    sim_buffer.sensordata[i],
+                    sim_buffer.sensordata[i + num_motor_],
+                    sim_buffer.sensordata[i + 2 * num_motor_]
+                };
             }
 
             if(imu_quat_adr_ >= 0) {
-                lowstate->msg_.imu_state().quaternion()[0] = mj_data_->sensordata[imu_quat_adr_ + 0];
-                lowstate->msg_.imu_state().quaternion()[1] = mj_data_->sensordata[imu_quat_adr_ + 1];
-                lowstate->msg_.imu_state().quaternion()[2] = mj_data_->sensordata[imu_quat_adr_ + 2];
-                lowstate->msg_.imu_state().quaternion()[3] = mj_data_->sensordata[imu_quat_adr_ + 3];
+                for(int k=0; k<4; k++) imu_quat[k] = sim_buffer.sensordata[imu_quat_adr_ + k];
+            }
+            if(imu_gyro_adr_ >= 0) {
+                for(int k=0; k<3; k++) imu_gyro[k] = sim_buffer.sensordata[imu_gyro_adr_ + k];
+            }
+            if(imu_acc_adr_ >= 0) {
+                for(int k=0; k<3; k++) imu_acc[k] = sim_buffer.sensordata[imu_acc_adr_ + k];
+            }
+        } // release buf_lock
 
+        if(lowstate->trylock()) {
+            for(int i = 0; i < num_motor_; i++) {
+                lowstate->msg_.motor_state()[i].q()       = motor_state[i].q;
+                lowstate->msg_.motor_state()[i].dq()      = motor_state[i].dq;
+                lowstate->msg_.motor_state()[i].tau_est() = motor_state[i].tau;
+            }
+
+            if(imu_quat_adr_ >= 0) {
                 // Prevent uninitialized zero-quaternion from causing NaN in TF during HEADLESS=1 startup
-                if (lowstate->msg_.imu_state().quaternion()[0] == 0.0 &&
-                    lowstate->msg_.imu_state().quaternion()[1] == 0.0 &&
-                    lowstate->msg_.imu_state().quaternion()[2] == 0.0 &&
-                    lowstate->msg_.imu_state().quaternion()[3] == 0.0) {
-                    lowstate->msg_.imu_state().quaternion()[0] = 1.0;
+                if (imu_quat[0] == 0.0 && imu_quat[1] == 0.0 && imu_quat[2] == 0.0 && imu_quat[3] == 0.0) {
+                    imu_quat[0] = 1.0;
                 }
+                for(int k=0; k<4; k++) lowstate->msg_.imu_state().quaternion()[k] = imu_quat[k];
 
-                double w = lowstate->msg_.imu_state().quaternion()[0];
-                double x = lowstate->msg_.imu_state().quaternion()[1];
-                double y = lowstate->msg_.imu_state().quaternion()[2];
-                double z = lowstate->msg_.imu_state().quaternion()[3];
+                double w = imu_quat[0];
+                double x = imu_quat[1];
+                double y = imu_quat[2];
+                double z = imu_quat[3];
 
                 lowstate->msg_.imu_state().rpy()[0] = atan2(2*(w*x + y*z), 1 - 2*(x*x + y*y));
                 lowstate->msg_.imu_state().rpy()[1] = asin(2*(w*y - z*x));
@@ -687,158 +760,181 @@ public:
             }
 
             if(imu_gyro_adr_ >= 0) {
-                lowstate->msg_.imu_state().gyroscope()[0] = mj_data_->sensordata[imu_gyro_adr_ + 0];
-                lowstate->msg_.imu_state().gyroscope()[1] = mj_data_->sensordata[imu_gyro_adr_ + 1];
-                lowstate->msg_.imu_state().gyroscope()[2] = mj_data_->sensordata[imu_gyro_adr_ + 2];
+                for(int k=0; k<3; k++) lowstate->msg_.imu_state().gyroscope()[k] = imu_gyro[k];
             }
 
             if(imu_acc_adr_ >= 0) {
-                lowstate->msg_.imu_state().accelerometer()[0] = mj_data_->sensordata[imu_acc_adr_ + 0];
-                lowstate->msg_.imu_state().accelerometer()[1] = mj_data_->sensordata[imu_acc_adr_ + 1];
-                lowstate->msg_.imu_state().accelerometer()[2] = mj_data_->sensordata[imu_acc_adr_ + 2];
+                for(int k=0; k<3; k++) lowstate->msg_.imu_state().accelerometer()[k] = imu_acc[k];
             }
 
-            lowstate->msg_.tick() = std::round(mj_data_->time / 1e-3);
+            lowstate->msg_.tick() = std::round(current_time / 1e-3);
             lowstate->unlockAndPublish();
-        }
-
-        // highstate
-        if(highstate->trylock()) {
-            if(frame_pos_adr_ >= 0) {
-                highstate->msg_.position()[0] = mj_data_->sensordata[frame_pos_adr_ + 0];
-                highstate->msg_.position()[1] = mj_data_->sensordata[frame_pos_adr_ + 1];
-                highstate->msg_.position()[2] = mj_data_->sensordata[frame_pos_adr_ + 2];
-            }
-            if(frame_vel_adr_ >= 0) {
-                highstate->msg_.velocity()[0] = mj_data_->sensordata[frame_vel_adr_ + 0];
-                highstate->msg_.velocity()[1] = mj_data_->sensordata[frame_vel_adr_ + 1];
-                highstate->msg_.velocity()[2] = mj_data_->sensordata[frame_vel_adr_ + 2];
-            }
-            highstate->unlockAndPublish();
         }
 
         // wireless_controller
         if(wireless_controller->joystick) {
             wireless_controller->unlockAndPublish();
         }
-
-        // ---- Lidar Raycasting ----
-        static int lidar_debug_throttle = 0;
-        if (lidar_debug_throttle++ % 1000 == 0) {
-            std::cout << "[DEBUG] Lidar timing check: d->time=" << mj_data_->time 
-                      << " next_lidar=" << next_lidar_time_ << std::endl;
-        }
-
-        if (mj_data_->time > 0.0 && mj_data_->time >= next_lidar_time_) {
-            next_lidar_time_ = mj_data_->time + 1.0 / lidar_publish_rate_;
-
-            int base_link_id = mj_name2id(mj_model_, mjOBJ_BODY, "base_link");
-            std::cout << "[DEBUG] Firing Lidar raycasting. base_link_id=" << base_link_id << std::endl;
-
-            LidarConfig front_cfg{"front_lidar_site", "front_lidar_link", front_lidar_publisher_};
-            ProcessLidar(front_cfg, front_lidar_state_, base_link_id);
-
-            LidarConfig rear_cfg{"rear_lidar_site", "rear_lidar_link", rear_lidar_publisher_};
-            ProcessLidar(rear_cfg, rear_lidar_state_, base_link_id);
-        }
-        if (mj_data_->time >= next_camera_time_) {
-            next_camera_time_ = mj_data_->time + 1.0 / camera_publish_rate_;
-
-            int cam_id = mj_name2id(mj_model_, mjOBJ_CAMERA, "front_camera");
-            
-            static bool camera_debug_printed = false;
-            if (cam_id < 0 && !camera_debug_printed) {
-                std::cout << "[DEBUG] Camera 'front_camera' not found in MJCF!" << std::endl;
-                camera_debug_printed = true;
-            }
-            
-            bool is_headless = false;
-            if (const char* env_p = std::getenv("HEADLESS")) {
-                std::string env_s(env_p);
-                if (env_s == "1" || env_s == "true" || env_s == "TRUE" || env_s == "True") {
-                    is_headless = true;
-                }
-            }
-
-            static bool window_debug_printed = false;
-            if (!g_offscreen_window && !window_debug_printed) {
-                std::cout << "[DEBUG] Camera rendering aborted: g_offscreen_window is null (GLFW failed to create window in headless mode)." << std::endl;
-                window_debug_printed = true;
-            }
-
-            if (g_offscreen_window) {
-                glfwMakeContextCurrent(g_offscreen_window);
-
-                if (!gl_initialized_) {
-                    // This ensures the GPU context is tied to the current bridge thread
-                    mjv_defaultScene(&scn_);
-                    mjv_makeScene(mj_model_, &scn_, 2000); 
-
-                    mjr_defaultContext(&con_);
-                    mjr_makeContext(mj_model_, &con_, mjFONTSCALE_150);
-                    mjr_setBuffer(mjFB_OFFSCREEN, &con_);
-                    
-                    mjv_defaultOption(&opt_);
-                    mjv_defaultCamera(&front_cam_);
-                    
-                    gl_initialized_ = true;
-                    std::cout << "Camera Rendering Context Initialized in Bridge Thread." << std::endl;
-                }
-                
-                if (cam_id >= 0 && camera_publisher_) {
-                    int width = 640;
-                    int height = 480;
-                    
-                    std::vector<unsigned char> rgb_buffer(width * height * 3, 0);
-                    
-                    front_cam_.type = mjCAMERA_FIXED;
-                    front_cam_.fixedcamid = cam_id;
-                    
-                    mjv_updateScene(mj_model_, mj_data_, &opt_, nullptr, &front_cam_, mjCAT_ALL, &scn_);
-                    mjrRect viewport = {0, 0, width, height};
-                    mjr_render(viewport, &scn_, &con_);
-                    mjr_readPixels(rgb_buffer.data(), nullptr, viewport, &con_);
-
-                    // 1. Initialize PointCloud2 message
-                    sensor_msgs::msg::dds_::PointCloud2_ msg;
-                    msg.header().frame_id() = "mujoco_front_camera_link";
-                    msg.header().stamp().sec()     = static_cast<int32_t>(mj_data_->time);
-                    msg.header().stamp().nanosec() = static_cast<uint32_t>((mj_data_->time - msg.header().stamp().sec()) * 1e9);
-
-                    msg.height() = height;
-                    msg.width() = width;
-                    msg.point_step() = sizeof(Pixel); // Automatically 3
-                    msg.row_step() = width * sizeof(Pixel);
-                    msg.data().resize(height * msg.row_step());
-
-                    // 2. Cast the buffers to our struct type for clean access
-                    Pixel* dest = reinterpret_cast<Pixel*>(msg.data().data());
-                    const Pixel* src = reinterpret_cast<const Pixel*>(rgb_buffer.data());
-
-                    // 3. Flip and Fill
-                    for (int y = 0; y < height; ++y) {
-                        int src_row = (height - 1 - y) * width;
-                        int dest_row = y * width;
-                        
-                        for (int x = 0; x < width; ++x) {
-                            dest[dest_row + x] = src[src_row + x];
-                        }
-                    }
-
-                    camera_publisher_->Write(msg);
-                }
-            }
-        }
-        
     }
 
-    std::unique_ptr<HighState_t> highstate;
+    virtual void run_lidar()
+    {
+        if(!mj_data_) return;
+
+        double current_time = 0.0;
+        mjtNum front_site_xmat[9], rear_site_xmat[9];
+        int base_link_id = -1;
+        bool run_lidar = false;
+        
+        {
+            std::unique_lock<std::recursive_mutex> sim_lock(*sim_mtx_);
+            current_time = mj_data_->time;
+            if (current_time > 0.0 && current_time >= next_lidar_time_) {
+                run_lidar = true;
+                next_lidar_time_ += 1.0 / lidar_publish_rate_;
+                if (current_time > next_lidar_time_) {
+                    next_lidar_time_ = current_time; // Prevent spiral of death if lagging
+                }
+
+                // OPTIMIZATION: Make a fast copy of the mjData state to evaluate rays against, allowing the physics thread to resume instantly
+                if (!lidar_data_) lidar_data_ = mj_makeData(mj_model_);
+                mj_copyData(lidar_data_, mj_model_, mj_data_);
+                
+                for (int t = 0; t < num_lidar_threads_; t++) {
+                    if (!lidar_data_threads_[t])
+                        lidar_data_threads_[t] = mj_makeData(mj_model_);
+                    mj_copyData(lidar_data_threads_[t], mj_model_, lidar_data_);
+                }
+            }
+        }
+
+        if (run_lidar) {
+            base_link_id = mj_name2id(mj_model_, mjOBJ_BODY, "base_link");
+            ComputeLidarRaycast(lidar_data_, "front_lidar_site", front_lidar_state_, base_link_id, front_site_xmat);
+            ComputeLidarRaycast(lidar_data_, "rear_lidar_site", rear_lidar_state_, base_link_id, rear_site_xmat);
+
+            LidarConfig front_cfg{"front_lidar_site", "front_lidar_link", front_lidar_publisher_};
+            BuildAndPublishPointCloud(front_cfg, front_lidar_state_, front_site_xmat, current_time);
+
+            LidarConfig rear_cfg{"rear_lidar_site", "rear_lidar_link", rear_lidar_publisher_};
+            BuildAndPublishPointCloud(rear_cfg, rear_lidar_state_, rear_site_xmat, current_time);
+        }
+    }
+
+    virtual void run_camera()
+    {
+        if(!mj_data_) return;
+
+        double current_time = 0.0;
+        int cam_id = -1;
+        bool do_render = false;
+
+        {
+            std::unique_lock<std::recursive_mutex> sim_lock(*sim_mtx_);
+            current_time = mj_data_->time;
+            if (current_time >= next_camera_time_) {
+                do_render = true;
+                next_camera_time_ = current_time + 1.0 / camera_publish_rate_;
+                
+                // OPTIMIZATION: Fast clone of the mjData state. mjv_updateScene is expensive and will be run asynchronously on this copy.
+                if (!camera_data_) camera_data_ = mj_makeData(mj_model_);
+                mj_copyData(camera_data_, mj_model_, mj_data_); // fast copy only
+            }
+        }
+
+        if (!do_render) return;
+        
+        cam_id = mj_name2id(mj_model_, mjOBJ_CAMERA, "front_camera");
+        if (cam_id < 0 || !camera_publisher_) return;
+
+        if (!gl_initialized_) {
+            if (g_offscreen_window) {
+                glfwMakeContextCurrent(g_offscreen_window);
+            }
+            // OPTIMIZATION: Disable VSync (glfwSwapInterval(0)) to prevent the rendering thread from being capped by the monitor's refresh rate
+            glfwSwapInterval(0); // Disable VSync to prevent frame capping
+            mjv_defaultScene(&scn_);
+            mjv_makeScene(mj_model_, &scn_, 2000); 
+
+            mjr_defaultContext(&con_);
+            mjr_makeContext(mj_model_, &con_, mjFONTSCALE_150);
+            mjr_setBuffer(mjFB_OFFSCREEN, &con_);
+            
+            mjv_defaultOption(&opt_);
+            scn_.flags[mjRND_SHADOW] = 0;      // shadows are expensive on llvmpipe
+            scn_.flags[mjRND_REFLECTION] = 0;
+            scn_.flags[mjRND_FOG] = 0;
+            opt_.geomgroup[2] = 0;             // disable collision geometry rendering
+            mjv_defaultCamera(&front_cam_);
+            
+            gl_initialized_ = true;
+        }
+                    
+        int width = 320;
+        int height = 240;   // halved both these values
+        
+        front_cam_.type = mjCAMERA_FIXED;
+        front_cam_.fixedcamid = cam_id;
+        
+        auto t0 = std::chrono::high_resolution_clock::now();
+
+        // All outside the lock: updateScene, render, readback
+        mjv_updateScene(mj_model_, camera_data_, &opt_, nullptr, &front_cam_, mjCAT_ALL, &scn_);
+        
+        mjrRect viewport = {0, 0, width, height};
+        mjr_render(viewport, &scn_, &con_);
+        
+        // This is what worked before — use it
+        std::vector<unsigned char> rgb_buffer(width * height * 3);
+        mjr_readPixels(rgb_buffer.data(), nullptr, viewport, &con_);
+
+        // Build and publish message
+        sensor_msgs::msg::dds_::PointCloud2_ msg;
+        msg.header().frame_id() = "mujoco_front_camera_link";
+        msg.header().stamp().sec()     = static_cast<int32_t>(current_time);
+        msg.header().stamp().nanosec() = static_cast<uint32_t>(
+            (current_time - msg.header().stamp().sec()) * 1e9);
+
+        msg.height()       = height;
+        msg.width()        = width;
+        msg.point_step()   = sizeof(Pixel);
+        msg.row_step()     = width * sizeof(Pixel);
+        msg.is_dense()     = true;
+        msg.is_bigendian() = false;
+
+        msg.fields().resize(3);
+        auto set_field = [&](int idx, const std::string& name, uint32_t offset) {
+            msg.fields()[idx].name()     = name;
+            msg.fields()[idx].offset()   = offset;
+            msg.fields()[idx].datatype() = 2; // UINT8
+            msg.fields()[idx].count()    = 1;
+        };
+        set_field(0, "r", 0);
+        set_field(1, "g", 1);
+        set_field(2, "b", 2);
+
+        msg.data().resize(height * msg.row_step());
+        const Pixel* src  = reinterpret_cast<const Pixel*>(rgb_buffer.data());
+        Pixel*       dest = reinterpret_cast<Pixel*>(msg.data().data());
+
+        // Flip rows: OpenGL bottom-left origin -> ROS top-left origin
+        for (int y = 0; y < height; ++y) {
+            int src_row  = (height - 1 - y) * width;
+            int dest_row = y * width;
+            std::memcpy(&dest[dest_row], &src[src_row], width * sizeof(Pixel));
+        }
+
+        camera_publisher_->Write(msg);
+    }
+
     std::unique_ptr<WirelessController_t> wireless_controller;
     std::shared_ptr<LowCmd_t> lowcmd;
     std::unique_ptr<LowState_t> lowstate;
 
 private:
     unitree::common::RecurrentThreadPtr thread_;
+    unitree::common::RecurrentThreadPtr lidar_thread_;
+    unitree::common::RecurrentThreadPtr camera_thread_;
 };
 
 using Go2Bridge = RobotBridge<unitree::robot::go2::subscription::LowCmd, unitree::robot::go2::publisher::LowState>;
@@ -867,27 +963,36 @@ public:
     {
         RobotBridge::run();
 
-        if (secondary_imustate->trylock()) {
-            std::lock_guard<std::recursive_mutex> sim_lock(*sim_mtx_);
+        double sec_imu_quat[4] = {1.0, 0.0, 0.0, 0.0};
+        double sec_imu_gyro[3] = {0.0, 0.0, 0.0};
+        double sec_imu_acc[3]  = {0.0, 0.0, 0.0};
+        bool publish_sec_imu = false;
 
+        {
+            std::unique_lock<std::mutex> buf_lock(sim_buffer.mtx);
+            if (sim_buffer.sensordata.empty()) return;
             if(secondary_imu_quat_adr_ >= 0) {
-                secondary_imustate->msg_.quaternion()[0] = mj_data_->sensordata[secondary_imu_quat_adr_ + 0];
-                secondary_imustate->msg_.quaternion()[1] = mj_data_->sensordata[secondary_imu_quat_adr_ + 1];
-                secondary_imustate->msg_.quaternion()[2] = mj_data_->sensordata[secondary_imu_quat_adr_ + 2];
-                secondary_imustate->msg_.quaternion()[3] = mj_data_->sensordata[secondary_imu_quat_adr_ + 3];
+                for(int k=0; k<4; k++) sec_imu_quat[k] = sim_buffer.sensordata[secondary_imu_quat_adr_ + k];
+            }
+            if(secondary_imu_gyro_adr_ >= 0) {
+                for(int k=0; k<3; k++) sec_imu_gyro[k] = sim_buffer.sensordata[secondary_imu_gyro_adr_ + k];
+            }
+            if(secondary_imu_acc_adr_ >= 0) {
+                for(int k=0; k<3; k++) sec_imu_acc[k] = sim_buffer.sensordata[secondary_imu_acc_adr_ + k];
+            }
+        }
 
-                // Prevent uninitialized zero-quaternion from causing NaN in TF during HEADLESS=1 startup
-                if (secondary_imustate->msg_.quaternion()[0] == 0.0 &&
-                    secondary_imustate->msg_.quaternion()[1] == 0.0 &&
-                    secondary_imustate->msg_.quaternion()[2] == 0.0 &&
-                    secondary_imustate->msg_.quaternion()[3] == 0.0) {
-                    secondary_imustate->msg_.quaternion()[0] = 1.0;
+        if (secondary_imustate->trylock()) {
+            if(secondary_imu_quat_adr_ >= 0) {
+                if (sec_imu_quat[0] == 0.0 && sec_imu_quat[1] == 0.0 && sec_imu_quat[2] == 0.0 && sec_imu_quat[3] == 0.0) {
+                    sec_imu_quat[0] = 1.0;
                 }
+                for(int k=0; k<4; k++) secondary_imustate->msg_.quaternion()[k] = sec_imu_quat[k];
 
-                double w = secondary_imustate->msg_.quaternion()[0];
-                double x = secondary_imustate->msg_.quaternion()[1];
-                double y = secondary_imustate->msg_.quaternion()[2];
-                double z = secondary_imustate->msg_.quaternion()[3];
+                double w = sec_imu_quat[0];
+                double x = sec_imu_quat[1];
+                double y = sec_imu_quat[2];
+                double z = sec_imu_quat[3];
 
                 secondary_imustate->msg_.rpy()[0] = atan2(2*(w*x + y*z), 1 - 2*(x*x + y*y));
                 secondary_imustate->msg_.rpy()[1] = asin(2*(w*y - z*x));
@@ -895,17 +1000,17 @@ public:
             }
 
             if(secondary_imu_gyro_adr_ >= 0) {
-                secondary_imustate->msg_.gyroscope()[0] = mj_data_->sensordata[secondary_imu_gyro_adr_ + 0];
-                secondary_imustate->msg_.gyroscope()[1] = mj_data_->sensordata[secondary_imu_gyro_adr_ + 1];
-                secondary_imustate->msg_.gyroscope()[2] = mj_data_->sensordata[secondary_imu_gyro_adr_ + 2];
+                for(int k=0; k<3; k++) secondary_imustate->msg_.gyroscope()[k] = sec_imu_gyro[k];
             }
 
             if(secondary_imu_acc_adr_ >= 0) {
-                secondary_imustate->msg_.accelerometer()[0] = mj_data_->sensordata[secondary_imu_acc_adr_ + 0];
-                secondary_imustate->msg_.accelerometer()[1] = mj_data_->sensordata[secondary_imu_acc_adr_ + 1];
-                secondary_imustate->msg_.accelerometer()[2] = mj_data_->sensordata[secondary_imu_acc_adr_ + 2];
+                for(int k=0; k<3; k++) secondary_imustate->msg_.accelerometer()[k] = sec_imu_acc[k];
             }
 
+            publish_sec_imu = true;
+        }
+
+        if (publish_sec_imu) {
             secondary_imustate->unlockAndPublish();
         }
 

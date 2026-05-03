@@ -35,6 +35,7 @@
 #include "simulate.h"
 #include "array_safety.h"
 #include "unitree_sdk2_bridge.h"
+#include "sim_buffer.h"
 #include "param.h"
 #include <ament_index_cpp/get_package_share_directory.hpp>
 #include <GLFW/glfw3.h>
@@ -373,6 +374,13 @@ namespace
           free(ctrlnoise);
           ctrlnoise = (mjtNum *)malloc(sizeof(mjtNum) * m->nu);
           mju_zero(ctrlnoise, m->nu);
+          // Copy data into the shared buffer
+          {
+            std::unique_lock<std::mutex> buf_lock(sim_buffer.mtx);
+            sim_buffer.sensordata.assign(d->sensordata, d->sensordata + m->nsensordata);
+            sim_buffer.ctrl.assign(d->ctrl, d->ctrl + m->nu);
+            sim_buffer.time = d->time;
+          }
         }
         else
         {
@@ -403,6 +411,13 @@ namespace
           free(ctrlnoise);
           ctrlnoise = static_cast<mjtNum *>(malloc(sizeof(mjtNum) * m->nu));
           mju_zero(ctrlnoise, m->nu);
+          // Copy data into the shared buffer
+          {
+            std::unique_lock<std::mutex> buf_lock(sim_buffer.mtx);
+            sim_buffer.sensordata.assign(d->sensordata, d->sensordata + m->nsensordata);
+            sim_buffer.ctrl.assign(d->ctrl, d->ctrl + m->nu);
+            sim_buffer.time = d->time;
+          }
         }
         else
         {
@@ -473,6 +488,15 @@ namespace
             // elapsed CPU and simulation time since last sync
             const auto elapsedCPU = startCPU - syncCPU;
             double elapsedSim = d->time - syncSim;
+            // Copies motor commands from the buffer
+            {
+              std::unique_lock<std::mutex> buf_lock(sim_buffer.mtx);
+              if (sim_buffer.ctrl.size() == (size_t)m->nu) {
+                for (int i = 0; i < m->nu; ++i) {
+                  d->ctrl[i] = sim_buffer.ctrl[i];
+                }
+              }
+            }
 
             // inject noise
             if (sim.ctrl_noise_std)
@@ -487,7 +511,7 @@ namespace
                 ctrlnoise[i] = rate * ctrlnoise[i] + scale * mju_standardNormal(nullptr);
 
                 // apply noise
-                d->ctrl[i] = ctrlnoise[i];
+                d->ctrl[i] += ctrlnoise[i];
               }
             }
 
@@ -510,6 +534,12 @@ namespace
               // run single step, let next iteration deal with timing
               mj_step(m, d);
               stepped = true;
+              // Copy the simulation state into the buffer
+              {
+                std::unique_lock<std::mutex> buf_lock(sim_buffer.mtx);
+                sim_buffer.sensordata.assign(d->sensordata, d->sensordata + m->nsensordata);
+                sim_buffer.time = d->time;
+              }
             }
 
             // sim time mode: one step per loop iteration.
@@ -536,6 +566,12 @@ namespace
 
               mj_step(m, d);
               stepped = true;
+              // Copy the simulation state into the buffer
+              {
+                std::unique_lock<std::mutex> buf_lock(sim_buffer.mtx);
+                sim_buffer.sensordata.assign(d->sensordata, d->sensordata + m->nsensordata);
+                sim_buffer.time = d->time;
+              }
 
               // If sim is ahead of wall time, sleep until they're aligned.
               // This prevents running faster than real time.
@@ -564,6 +600,12 @@ namespace
             // run mj_forward, to update rendering and joint sliders
             mj_forward(m, d);
             sim.speed_changed = true;
+            // Copy the simulation state into the buffer
+            {
+              std::unique_lock<std::mutex> buf_lock(sim_buffer.mtx);
+              sim_buffer.sensordata.assign(d->sensordata, d->sensordata + m->nsensordata);
+              sim_buffer.time = d->time;
+            }
           }
         }
       } // release std::lock_guard<std::mutex>
@@ -613,6 +655,13 @@ void PhysicsThread(mj::Simulate *sim, const char *filename)
       free(ctrlnoise);
       ctrlnoise = static_cast<mjtNum *>(malloc(sizeof(mjtNum) * m->nu));
       mju_zero(ctrlnoise, m->nu);
+      // Copy the simulation state and the executed motor commands into the buffer
+      {
+        std::unique_lock<std::mutex> buf_lock(sim_buffer.mtx);
+        sim_buffer.sensordata.assign(d->sensordata, d->sensordata + m->nsensordata);
+        sim_buffer.ctrl.assign(d->ctrl, d->ctrl + m->nu);
+        sim_buffer.time = d->time;
+      }
 
       if (is_headless) {
         sim->run = 1;
